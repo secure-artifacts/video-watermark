@@ -21,6 +21,15 @@ SUPPORTED  = {".mp4",".mkv",".mov",".avi",".wmv",".flv",".webm",".m4v",".ts"}
 TIME_RE    = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d\d)")
 SPEED_RE   = re.compile(r"speed=\s*([\d.]+)x")
 
+class NoScrollCombo(QComboBox):
+    """禁止鼠标滚轮切换选项"""
+    def wheelEvent(self, e): e.ignore()
+
+class NoScrollSlider(QSlider):
+    """禁止鼠标滚轮调节值"""
+    def wheelEvent(self, e): e.ignore()
+
+
 FONTS = {
     "Arial":    "C:/Windows/Fonts/arial.ttf",
     "Segoe UI": "C:/Windows/Fonts/segoeui.ttf",
@@ -29,27 +38,35 @@ FONTS = {
 
 ENCODER_PROFILES = {
     "h264_nvenc": {
+        "极压  CRF 35":    ["-c:v","h264_nvenc","-preset","p1","-rc","vbr","-cq","35"],
+        "压缩  CRF 28":    ["-c:v","h264_nvenc","-preset","p2","-rc","vbr","-cq","28"],
         "快速  CRF 23":    ["-c:v","h264_nvenc","-preset","p2","-rc","vbr","-cq","23"],
         "高质量  CRF 18":  ["-c:v","h264_nvenc","-preset","p4","-rc","vbr","-cq","18"],
         "近乎无损  CRF 10":["-c:v","h264_nvenc","-preset","p6","-rc","vbr","-cq","10"],
     },
     "h264_qsv": {
+        "极压  CRF 35":    ["-c:v","h264_qsv","-preset","fast",  "-global_quality","35"],
+        "压缩  CRF 28":    ["-c:v","h264_qsv","-preset","fast",  "-global_quality","28"],
         "快速  CRF 23":    ["-c:v","h264_qsv","-preset","fast",  "-global_quality","23"],
         "高质量  CRF 18":  ["-c:v","h264_qsv","-preset","medium","-global_quality","18"],
         "近乎无损  CRF 10":["-c:v","h264_qsv","-preset","slow",  "-global_quality","10"],
     },
     "h264_amf": {
+        "极压  CRF 35":    ["-c:v","h264_amf","-quality","speed",   "-rc","vbr_latency","-b:v","3M"],
+        "压缩  CRF 28":    ["-c:v","h264_amf","-quality","speed",   "-rc","vbr_latency","-b:v","5M"],
         "快速  CRF 23":    ["-c:v","h264_amf","-quality","speed",   "-rc","vbr_latency","-b:v","8M"],
         "高质量  CRF 18":  ["-c:v","h264_amf","-quality","balanced","-rc","vbr_peak",   "-b:v","12M"],
         "近乎无损  CRF 10":["-c:v","h264_amf","-quality","quality", "-rc","vbr_peak",   "-b:v","20M"],
     },
     "libx264": {
+        "极压  CRF 35":    ["-c:v","libx264","-preset","fast",  "-crf","35"],
+        "压缩  CRF 28":    ["-c:v","libx264","-preset","fast",  "-crf","28"],
         "快速  CRF 23":    ["-c:v","libx264","-preset","fast",  "-crf","23"],
         "高质量  CRF 18":  ["-c:v","libx264","-preset","medium","-crf","18"],
         "近乎无损  CRF 10":["-c:v","libx264","-preset","medium","-crf","10"],
     },
 }
-QUALITY_KEYS = ["快速  CRF 23", "高质量  CRF 18", "近乎无损  CRF 10"]
+QUALITY_KEYS = ["极压  CRF 35", "压缩  CRF 28", "快速  CRF 23", "高质量  CRF 18", "近乎无损  CRF 10"]
 
 POSITIONS = {
     "左上角": lambda m: (str(m), str(m)),
@@ -79,17 +96,48 @@ def _find_bin(name):
 
 
 def detect_encoder():
+    """
+    检测可用硬件编码器。
+    第一步：查 ffmpeg -encoders 确认编码器存在。
+    第二步：用最小参数实际编码 0.1 秒验证可用。
+    RTX 50 / 新驱动 兼容。
+    """
     ff = _find_bin("ffmpeg")
-    for enc in ("h264_nvenc","h264_qsv","h264_amf"):
+
+    # 先拿到所有可用编码器列表
+    try:
+        r = subprocess.run([ff, "-encoders"], capture_output=True,
+                           text=True, timeout=5, creationflags=NO_WINDOW)
+        encoder_list = r.stdout + r.stderr
+    except Exception:
+        encoder_list = ""
+
+    candidates = []
+    if "h264_nvenc" in encoder_list:
+        candidates.append("h264_nvenc")
+    if "h264_qsv" in encoder_list:
+        candidates.append("h264_qsv")
+    if "h264_amf" in encoder_list:
+        candidates.append("h264_amf")
+
+    for enc in candidates:
         try:
+            # 用 nullsrc 避免 lavfi color 在某些版本上的兼容问题
             r = subprocess.run(
-                [ff,"-f","lavfi","-i","color=c=black:s=64x64:d=0.1",
-                 "-c:v",enc,"-f","null","-"],
-                capture_output=True, timeout=8, creationflags=NO_WINDOW)
-            if r.returncode == 0:
+                [ff,
+                 "-f", "lavfi", "-i", "nullsrc=s=320x240:d=0.1",
+                 "-vf", "format=yuv420p",
+                 "-c:v", enc,
+                 "-frames:v", "1",
+                 "-f", "null", "-"],
+                capture_output=True, timeout=10, creationflags=NO_WINDOW)
+            # returncode 0 = 成功；同时排除 "No NVENC capable devices" 类错误
+            stderr_out = r.stderr.decode(errors="replace") if isinstance(r.stderr, bytes) else r.stderr
+            if r.returncode == 0 and "No capable" not in stderr_out and "Cannot load" not in stderr_out:
                 return enc
         except Exception:
             pass
+
     return "libx264"
 
 
@@ -133,7 +181,8 @@ class WatermarkWorker(QThread):
     def stop(self): self._stop = True
 
     def run(self):
-        encoder = detect_encoder()
+        manual = self.params.get("manual_encoder")
+        encoder = manual if manual else detect_encoder()
         self.encoder_detected.emit(encoder)
 
         p = self.params
@@ -305,9 +354,10 @@ class MainWindow(QMainWindow):
         self.resize(1200, 740)
         self.file_rows    = []
         self.worker       = None
-        self._current_pos = "右下角"
+        self._current_pos = "左上角"
         self._done_count  = 0
         self._total       = 0
+        self._task_done = False
         self._theme()
         self._build_ui()
         self._set_icon()
@@ -354,7 +404,9 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size:18px;font-weight:700;color:#fff;")
         self.tag_lbl = QLabel("  检测中…")
         self.tag_lbl.setStyleSheet("font-size:11px;background:#2a2a2a;color:#777;border-radius:10px;padding:2px 10px;")
-        hr = QHBoxLayout(); hr.addWidget(title); hr.addWidget(self.tag_lbl); hr.addStretch()
+
+        hr = QHBoxLayout()
+        hr.addWidget(title); hr.addWidget(self.tag_lbl); hr.addStretch()
         vl.addLayout(hr)
         self.drop_zone = DropZone()
         self.drop_zone.files_dropped.connect(self._add_files)
@@ -434,10 +486,10 @@ class MainWindow(QMainWindow):
             b = QPushButton(name); b.setCheckable(True); b.setFixedHeight(34)
             b.clicked.connect(lambda _,n=name: self._sel_pos(n))
             self.pos_btns[name] = b; pg.addWidget(b,row,col)
-        self._sel_pos("右下角"); vl.addLayout(pg)
+        self._sel_pos("左上角"); vl.addLayout(pg)
 
         vl.addWidget(self._sec("边距（水印距画面边缘 px）"))
-        self.mg_sl  = QSlider(Qt.Orientation.Horizontal)
+        self.mg_sl  = NoScrollSlider(Qt.Orientation.Horizontal)
         self.mg_sl.setRange(0,200); self.mg_sl.setValue(10)
         self.mg_val = QLabel("10 px"); self.mg_val.setFixedWidth(44)
         self.mg_val.setStyleSheet("color:#3498DB;font-size:12px;")
@@ -447,15 +499,26 @@ class MainWindow(QMainWindow):
 
         vl.addWidget(self._div())
 
-        vl.addWidget(self._sec("输出质量"))
-        self.quality_cb = QComboBox()
-        for k in QUALITY_KEYS: self.quality_cb.addItem(k)
-        self.quality_cb.setCurrentIndex(2)
-        vl.addWidget(self.quality_cb)
+        vl.addWidget(self._sec("编码器"))
+        self.enc_cb = NoScrollCombo()
+        self.enc_cb.addItem("🔍 自动检测")
+        self.enc_cb.addItem("🟢 NVIDIA GPU  (h264_nvenc)")
+        self.enc_cb.addItem("🟢 Intel GPU   (h264_qsv)")
+        self.enc_cb.addItem("🟢 AMD GPU     (h264_amf)")
+        self.enc_cb.addItem("🟡 CPU 软件编码 (libx264)")
+        self.enc_cb.setCurrentIndex(0)
+        self.enc_cb.setToolTip("自动检测失败时可手动指定显卡")
+        vl.addWidget(self.enc_cb)
         self.enc_hint = QLabel("编码器检测中…")
-        self.enc_hint.setStyleSheet("font-size:11px;color:#555;")
+        self.enc_hint.setStyleSheet("font-size:12px;color:#888;")
         self.enc_hint.setWordWrap(True)
         vl.addWidget(self.enc_hint)
+
+        vl.addWidget(self._sec("输出质量"))
+        self.quality_cb = NoScrollCombo()
+        for k in QUALITY_KEYS: self.quality_cb.addItem(k)
+        self.quality_cb.setCurrentIndex(4)
+        vl.addWidget(self.quality_cb)
 
         vl.addWidget(self._div())
 
@@ -496,8 +559,8 @@ class MainWindow(QMainWindow):
         return panel
 
     def _sec(self, t):
-        l = QLabel(t.upper())
-        l.setStyleSheet("font-size:10px;color:#555;letter-spacing:1.2px;margin-top:2px;")
+        l = QLabel(t)
+        l.setStyleSheet("font-size:12px;font-weight:600;color:#aaa;margin-top:4px;")
         return l
 
     def _div(self):
@@ -523,6 +586,10 @@ class MainWindow(QMainWindow):
         if d: self.out_edit.setText(d)
 
     def _add_files(self, paths):
+        # 上一批任务已完成，拖入新文件时自动清空旧记录
+        if self._task_done:
+            self._clear_files()
+            self._task_done = False
         existing = {r.filepath for r in self.file_rows}
         for p in paths:
             if p not in existing:
@@ -539,6 +606,21 @@ class MainWindow(QMainWindow):
         for r in self.file_rows: r.setParent(None); r.deleteLater()
         self.file_rows.clear(); self._refresh()
 
+    def _set_right_panel_enabled(self, enabled: bool):
+        """处理中禁用右侧所有控件（开始按钮除外）"""
+        skip = {self.start_btn}
+        for w in [self.wm_text, self.font_cb, self.font_sl, self.color_sw,
+                  self.op_sl, self.mg_sl, self.enc_cb, self.quality_cb,
+                  self.prefix_edit, self.out_edit]:
+            w.setEnabled(enabled)
+        for btn in self.pos_btns.values():
+            btn.setEnabled(enabled)
+        # 颜色快选按钮
+        for w in self.findChildren(QPushButton):
+            if w not in skip:
+                if hasattr(w, '_is_color_btn'):
+                    w.setEnabled(enabled)
+
     def _refresh(self):
         n = len(self.file_rows)
         self.files_lbl.setText(f"已选文件 ({n})")
@@ -546,7 +628,8 @@ class MainWindow(QMainWindow):
 
     def _start_stop(self):
         if self.worker and self.worker.isRunning():
-            self.worker.stop(); self.start_btn.setText("正在停止…"); self.start_btn.setEnabled(False); return
+            self.worker.stop(); self.start_btn.setText("正在停止…"); self.start_btn.setEnabled(False)
+        self._set_right_panel_enabled(True); self._task_done = True; return
         if not self.file_rows:
             QMessageBox.information(self,"提示","请先添加视频文件"); return
         for r in self.file_rows: r.reset()
@@ -569,6 +652,17 @@ class MainWindow(QMainWindow):
             "margin":    self.mg_sl.value(),
             "quality":   self.quality_cb.currentText(),
         }
+        # 手动指定编码器
+        enc_map = {
+            0: None,               # 自动检测
+            1: "h264_nvenc",
+            2: "h264_qsv",
+            3: "h264_amf",
+            4: "libx264",
+        }
+        manual_enc = enc_map.get(self.enc_cb.currentIndex())
+        params["manual_encoder"] = manual_enc
+
         self._done_count = 0; self._total = len(tasks)
         self.worker = WatermarkWorker(tasks, params)
         self.worker.encoder_detected.connect(self._on_encoder)
@@ -578,6 +672,7 @@ class MainWindow(QMainWindow):
         self.worker.start()
         self.start_btn.setText("停止处理")
         self.start_btn.setStyleSheet(self._bstyle("#c0392b","#a93226"))
+        self._set_right_panel_enabled(False)
 
     def _on_encoder(self, enc):
         name_map = {"h264_nvenc":"NVIDIA GPU 加速","h264_qsv":"Intel GPU 加速",
@@ -607,6 +702,8 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(True)
         self.start_btn.setText(f"开始处理  ({len(self.file_rows)} 个文件)")
         self.start_btn.setStyleSheet(self._bstyle("#3498DB","#2980b9"))
+        self._set_right_panel_enabled(True)
+        self._task_done = True
         QMessageBox.information(self,"完成",f"全部 {self._total} 个文件处理完毕！")
 
     def _check_ffmpeg(self):
