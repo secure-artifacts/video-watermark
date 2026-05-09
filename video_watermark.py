@@ -5,7 +5,7 @@
 运行: pythonw video_watermark.py
 """
 
-APP_VERSION  = "v1.2.2"
+APP_VERSION  = "v1.3.0"
 REPO         = "secure-artifacts/video-watermark"
 RELEASES_URL = f"https://github.com/{REPO}/releases/latest"
 API_URL      = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -17,10 +17,11 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QLineEdit, QSlider, QFileDialog,
     QProgressBar, QComboBox, QColorDialog, QFrame,
-    QGridLayout, QMessageBox, QSizePolicy, QScrollArea
+    QGridLayout, QMessageBox, QSizePolicy, QScrollArea,
+    QSplashScreen
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QColor, QIcon, QDragEnterEvent, QDropEvent
+from PyQt6.QtGui import QColor, QIcon, QDragEnterEvent, QDropEvent, QPixmap, QPainter, QFont, QLinearGradient
 
 NO_WINDOW  = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
 SUPPORTED  = {".mp4",".mkv",".mov",".avi",".wmv",".flv",".webm",".m4v",".ts"}
@@ -381,11 +382,12 @@ class MainWindow(QMainWindow):
         self._done_count  = 0
         self._total       = 0
         self._task_done = False
+        self._checking_silent = True
         self._theme()
         self._build_ui()
         self._set_icon()
-        QTimer.singleShot(200, self._check_ffmpeg)
-        QTimer.singleShot(1500, self._auto_check_update)  # 启动后静默检测
+        QTimer.singleShot(100, self._check_ffmpeg)
+        QTimer.singleShot(2000, self._auto_check_update)  # 启动后静默检测
 
     def _set_icon(self):
         try:
@@ -514,8 +516,8 @@ class MainWindow(QMainWindow):
 
         vl.addWidget(self._sec("透明度"))
         self.op_sl  = QSlider(Qt.Orientation.Horizontal)
-        self.op_sl.setRange(10,100); self.op_sl.setValue(80)
-        self.op_val = QLabel("80%"); self.op_val.setFixedWidth(36)
+        self.op_sl.setRange(10,100); self.op_sl.setValue(100)
+        self.op_val = QLabel("100%"); self.op_val.setFixedWidth(36)
         self.op_val.setStyleSheet("color:#3498DB;font-size:12px;")
         self.op_sl.valueChanged.connect(lambda v: self.op_val.setText(f"{v}%"))
         r2 = QHBoxLayout(); r2.addWidget(self.op_sl); r2.addWidget(self.op_val)
@@ -651,19 +653,13 @@ class MainWindow(QMainWindow):
         self.file_rows.clear(); self._refresh()
 
     def _set_right_panel_enabled(self, enabled: bool):
-        """处理中禁用右侧所有控件（开始按钮除外）"""
-        skip = {self.start_btn}
+        """处理中禁用右侧所有控件（开始按钮/检测更新按钮除外）"""
         for w in [self.wm_text, self.font_cb, self.font_sl, self.color_sw,
                   self.op_sl, self.mg_sl, self.enc_cb, self.quality_cb,
                   self.prefix_edit, self.out_edit]:
             w.setEnabled(enabled)
         for btn in self.pos_btns.values():
             btn.setEnabled(enabled)
-        # 颜色快选按钮
-        for w in self.findChildren(QPushButton):
-            if w not in skip:
-                if hasattr(w, '_is_color_btn'):
-                    w.setEnabled(enabled)
 
     def _refresh(self):
         n = len(self.file_rows)
@@ -671,51 +667,57 @@ class MainWindow(QMainWindow):
         self.start_btn.setText(f"开始处理  ({n} 个文件)" if n else "开始处理")
 
     def _start_stop(self):
+        # 正在处理中 → 点击变停止
         if self.worker and self.worker.isRunning():
-            self.worker.stop(); self.start_btn.setText("正在停止…"); self.start_btn.setEnabled(False)
-        self._set_right_panel_enabled(True); self._task_done = True; return
+            self.worker.stop()
+            self.start_btn.setText("正在停止…")
+            self.start_btn.setEnabled(False)
+            return
+
+        # 没有文件
         if not self.file_rows:
-            QMessageBox.information(self,"提示","请先添加视频文件"); return
+            QMessageBox.information(self, "提示", "请先添加视频文件")
+            return
+
+        # 重置状态
         for r in self.file_rows: r.reset()
         self.total_bar.setValue(0); self.total_bar.show()
         self.info_lbl.setText("正在检测编码器…"); self.info_lbl.show()
+
+        # 构建任务列表
         prefix  = self.prefix_edit.text().strip() or "加水印-"
         out_dir = self.out_edit.text().strip()
         tasks   = []
         for r in self.file_rows:
             p = Path(r.filepath)
             d = Path(out_dir) if out_dir else p.parent
-            tasks.append({"input":str(p),"output":str(d/(prefix+p.name))})
-        params = {
-            "text":      self.wm_text.text(),
-            "font":      self.font_cb.currentText(),
-            "font_size": self.font_sl.value(),
-            "color":     self.color_sw.get(),
-            "opacity":   self.op_sl.value(),
-            "position":  self._current_pos,
-            "margin":    self.mg_sl.value(),
-            "quality":   self.quality_cb.currentText(),
-        }
-        # 手动指定编码器
-        enc_map = {
-            0: None,               # 自动检测
-            1: "h264_nvenc",
-            2: "h264_qsv",
-            3: "h264_amf",
-            4: "libx264",
-        }
-        manual_enc = enc_map.get(self.enc_cb.currentIndex())
-        params["manual_encoder"] = manual_enc
+            tasks.append({"input": str(p), "output": str(d / (prefix + p.name))})
 
-        self._done_count = 0; self._total = len(tasks)
+        # 编码器和参数
+        enc_map = {0: None, 1: "h264_nvenc", 2: "h264_qsv", 3: "h264_amf", 4: "libx264"}
+        params = {
+            "text":           self.wm_text.text(),
+            "font":           self.font_cb.currentText(),
+            "font_size":      self.font_sl.value(),
+            "color":          self.color_sw.get(),
+            "opacity":        self.op_sl.value(),
+            "position":       self._current_pos,
+            "margin":         self.mg_sl.value(),
+            "quality":        self.quality_cb.currentText(),
+            "manual_encoder": enc_map.get(self.enc_cb.currentIndex()),
+        }
+
+        self._done_count = 0
+        self._total = len(tasks)
         self.worker = WatermarkWorker(tasks, params)
         self.worker.encoder_detected.connect(self._on_encoder)
         self.worker.progress.connect(self._on_prog)
         self.worker.file_done.connect(self._on_done)
         self.worker.all_done.connect(self._on_all_done)
         self.worker.start()
+
         self.start_btn.setText("停止处理")
-        self.start_btn.setStyleSheet(self._bstyle("#c0392b","#a93226"))
+        self.start_btn.setStyleSheet(self._bstyle("#c0392b", "#a93226"))
         self._set_right_panel_enabled(False)
 
     def _on_encoder(self, enc):
@@ -743,12 +745,12 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.total_bar.setValue(100)
         self.info_lbl.setText(f"✓ 全部完成  ({self._total} 个文件)")
+        self._set_right_panel_enabled(True)
+        self._task_done = True
         self.start_btn.setEnabled(True)
         self.start_btn.setText(f"开始处理  ({len(self.file_rows)} 个文件)")
         self.start_btn.setStyleSheet(self._bstyle("#3498DB","#2980b9"))
-        self._set_right_panel_enabled(True)
-        self._task_done = True
-        QMessageBox.information(self,"完成",f"全部 {self._total} 个文件处理完毕！")
+        QMessageBox.information(self, "完成", f"全部 {self._total} 个文件处理完毕！")
 
     def _check_ffmpeg(self):
         ff = _find_bin("ffmpeg")
@@ -757,7 +759,7 @@ class MainWindow(QMainWindow):
             ver = r.stdout.split("version")[1].split()[0] if "version" in r.stdout else ""
             self.tag_lbl.setText(f"  ✓  FFmpeg {ver}")
             self.tag_lbl.setStyleSheet("font-size:11px;background:#1a3d2b;color:#27ae60;border-radius:10px;padding:2px 10px;")
-            QTimer.singleShot(100, self._detect_enc_async)
+            QTimer.singleShot(300, self._detect_enc_async)
         except Exception:
             self.tag_lbl.setText("  ✗  未找到 FFmpeg")
             self.tag_lbl.setStyleSheet("font-size:11px;background:#3d1a1a;color:#e74c3c;border-radius:10px;padding:2px 10px;")
@@ -767,7 +769,8 @@ class MainWindow(QMainWindow):
         self._on_encoder(detect_encoder())
 
     # ── 更新检测 ─────────────────────────────────────────────────
-    _update_url = ""   # 记录最新版下载链接
+    _update_url  = ""   # 记录最新版下载链接
+    _latest_ver  = ""   # 记录最新版本号
 
     def _auto_check_update(self):
         """启动时静默检测，结果只更新按钮状态，绝不弹窗"""
@@ -776,14 +779,7 @@ class MainWindow(QMainWindow):
     def _check_update(self):
         """用户手动点击：若已知有更新直接弹窗；否则重新检测"""
         if self.update_btn.text() == "有可用更新" and MainWindow._update_url:
-            # 已经检测过有新版，直接弹下载对话框
-            import webbrowser
-            ret = QMessageBox.information(
-                self, "发现新版本",
-                f"当前版本：{APP_VERSION}\n\n前往下载页面？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if ret == QMessageBox.StandardButton.Yes:
-                webbrowser.open(MainWindow._update_url)
+            self._show_update_dialog(MainWindow._latest_ver, MainWindow._update_url)
             return
         self._run_checker(silent=False)
 
@@ -808,7 +804,8 @@ class MainWindow(QMainWindow):
     def _on_update_result(self, latest, url):
         self.update_btn.setEnabled(True)
         silent = self._checking_silent
-        MainWindow._update_url = url
+        MainWindow._update_url  = url
+        MainWindow._latest_ver  = latest
 
         if latest and latest != APP_VERSION:
             # 有可用更新 → 橙色背景显眼提示
@@ -861,8 +858,99 @@ class MainWindow(QMainWindow):
         e.accept()
 
 
+def create_splash():
+    """创建启动画面"""
+    w, h = 360, 220
+    pix = QPixmap(w, h)
+    pix.fill(Qt.GlobalColor.transparent)
+
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    # 深色圆角背景
+    from PyQt6.QtGui import QBrush, QPen, QColor as QC
+    from PyQt6.QtCore import QRectF
+    p.setBrush(QBrush(QC("#1a2035")))
+    p.setPen(QPen(QC("#2a3a5a"), 1))
+    p.drawRoundedRect(QRectF(1, 1, w-2, h-2), 14, 14)
+
+    # 软件名
+    f_title = QFont("Microsoft YaHei", 16, QFont.Weight.Bold)
+    p.setFont(f_title)
+    p.setPen(QC("#ffffff"))
+    p.drawText(QRectF(0, 68, w, 36), Qt.AlignmentFlag.AlignHCenter, "视频批量加水印")
+
+    # 英文副标题
+    f_sub = QFont("Segoe UI", 10)
+    p.setFont(f_sub)
+    p.setPen(QC("#5a7aaa"))
+    p.drawText(QRectF(0, 102, w, 24), Qt.AlignmentFlag.AlignHCenter, "Video Watermark Tool")
+
+    # 版本号
+    f_ver = QFont("Segoe UI", 9)
+    p.setFont(f_ver)
+    p.setPen(QC("#3498DB"))
+    p.drawText(QRectF(0, 130, w, 20), Qt.AlignmentFlag.AlignHCenter, APP_VERSION)
+
+    # 进度条背景
+    bar_x, bar_y, bar_w, bar_h = (w-160)//2, 162, 160, 3
+    p.setBrush(QBrush(QC("#1e2d45")))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 2, 2)
+
+    # 提示文字
+    f_hint = QFont("Microsoft YaHei", 8)
+    p.setFont(f_hint)
+    p.setPen(QC("#2a3a5a"))
+    p.drawText(QRectF(0, 174, w, 20), Qt.AlignmentFlag.AlignHCenter, "正在加载…")
+
+    p.end()
+    return pix, (bar_x, bar_y, bar_w, bar_h)
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName("视频批量加水印")
-    MainWindow().show()
+
+    # 启动画面
+    splash_pix, bar_info = create_splash()
+    splash = QSplashScreen(splash_pix, Qt.WindowType.WindowStaysOnTopHint)
+    splash.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+    splash.show()
+    app.processEvents()
+
+    # 进度条动画（分 10 步推进）
+    from PyQt6.QtGui import QBrush, QPen, QColor as QC
+    from PyQt6.QtCore import QRectF
+    bar_x, bar_y, bar_w, bar_h = bar_info
+
+    def update_progress(step):
+        pct = step / 10
+        cur_w = int(bar_w * pct)
+        p2 = QPainter(splash_pix)
+        p2.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # 清除旧进度
+        p2.setBrush(QBrush(QC("#1e2d45")))
+        p2.setPen(Qt.PenStyle.NoPen)
+        p2.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 2, 2)
+        # 画新进度
+        if cur_w > 0:
+            p2.setBrush(QBrush(QC("#3498DB")))
+            p2.drawRoundedRect(QRectF(bar_x, bar_y, cur_w, bar_h), 2, 2)
+        p2.end()
+        splash.setPixmap(splash_pix)
+        app.processEvents()
+
+    # 每 150ms 推一步，共 10 步 = 1.5 秒
+    for i in range(1, 11):
+        QTimer.singleShot(i * 150, lambda s=i: update_progress(s))
+
+    # 加载主窗口
+    win = MainWindow()
+
+    def show_main():
+        splash.finish(win)
+        win.show()
+
+    QTimer.singleShot(1600, show_main)
     sys.exit(app.exec())
