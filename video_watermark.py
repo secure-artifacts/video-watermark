@@ -5,7 +5,13 @@
 运行: pythonw video_watermark.py
 """
 
+APP_VERSION  = "v1.2.2"
+REPO         = "secure-artifacts/video-watermark"
+RELEASES_URL = f"https://github.com/{REPO}/releases/latest"
+API_URL      = f"https://api.github.com/repos/{REPO}/releases/latest"
+
 import sys, os, subprocess, platform, re, base64, tempfile
+import urllib.request, urllib.error, json
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -164,6 +170,23 @@ def parse_time_ms(line):
 def parse_speed(line):
     m = SPEED_RE.search(line)
     return m.group(1) if m else None
+
+
+class UpdateChecker(QThread):
+    result = pyqtSignal(str, str)
+    error  = pyqtSignal(str)
+
+    def run(self):
+        try:
+            req = urllib.request.Request(
+                API_URL, headers={"User-Agent": "video-watermark-updater"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+            tag = data.get("tag_name", "")
+            url = data.get("html_url", RELEASES_URL)
+            self.result.emit(tag, url)
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class WatermarkWorker(QThread):
@@ -362,6 +385,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._set_icon()
         QTimer.singleShot(200, self._check_ffmpeg)
+        QTimer.singleShot(1500, self._auto_check_update)  # 启动后静默检测
 
     def _set_icon(self):
         try:
@@ -428,6 +452,26 @@ class MainWindow(QMainWindow):
         self.file_vl.addStretch()
         scroll.setWidget(self.file_box)
         vl.addWidget(scroll, stretch=1)
+
+        # 左下角版本号 + 检测更新（紧挨在一起）
+        bot = QHBoxLayout()
+        bot.setContentsMargins(0, 4, 0, 0)
+        bot.setSpacing(6)
+        self.ver_lbl = QLabel(f"版本  {APP_VERSION}")
+        self.ver_lbl.setStyleSheet("font-size:11px;color:#555;")
+        self.update_btn = QPushButton("检测更新")
+        self.update_btn.setFixedHeight(22)
+        self.update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_btn.setStyleSheet(
+            "QPushButton{background:transparent;border:1px solid #3a3a3a;"
+            "border-radius:11px;color:#666;font-size:11px;padding:0 10px;}"
+            "QPushButton:hover{border-color:#3498DB;color:#3498DB;}")
+        self.update_btn.clicked.connect(self._check_update)
+        bot.addWidget(self.ver_lbl)
+        bot.addWidget(self.update_btn)
+        bot.addStretch()
+        vl.addLayout(bot)
+
         return w
 
     def _right_panel(self):
@@ -721,6 +765,96 @@ class MainWindow(QMainWindow):
 
     def _detect_enc_async(self):
         self._on_encoder(detect_encoder())
+
+    # ── 更新检测 ─────────────────────────────────────────────────
+    _update_url = ""   # 记录最新版下载链接
+
+    def _auto_check_update(self):
+        """启动时静默检测，结果只更新按钮状态，绝不弹窗"""
+        self._run_checker(silent=True)
+
+    def _check_update(self):
+        """用户手动点击：若已知有更新直接弹窗；否则重新检测"""
+        if self.update_btn.text() == "有可用更新" and MainWindow._update_url:
+            # 已经检测过有新版，直接弹下载对话框
+            import webbrowser
+            ret = QMessageBox.information(
+                self, "发现新版本",
+                f"当前版本：{APP_VERSION}\n\n前往下载页面？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if ret == QMessageBox.StandardButton.Yes:
+                webbrowser.open(MainWindow._update_url)
+            return
+        self._run_checker(silent=False)
+
+    def _run_checker(self, silent):
+        self._checking_silent = silent
+        self.update_btn.setEnabled(False)
+        if silent:
+            self.update_btn.setText("检测更新")
+        else:
+            self.update_btn.setText("检测中…")
+        checker = UpdateChecker()
+        checker.result.connect(self._on_update_result)
+        checker.error.connect(self._on_update_error)
+        checker.start()
+        self._updater = checker   # 防止被 GC
+
+    def _btn_style_default(self):
+        return ("QPushButton{background:transparent;border:1px solid #3a3a3a;"
+                "border-radius:11px;color:#666;font-size:11px;padding:0 10px;}"
+                "QPushButton:hover{border-color:#3498DB;color:#3498DB;}")
+
+    def _on_update_result(self, latest, url):
+        self.update_btn.setEnabled(True)
+        silent = self._checking_silent
+        MainWindow._update_url = url
+
+        if latest and latest != APP_VERSION:
+            # 有可用更新 → 橙色背景显眼提示
+            self.update_btn.setText("有可用更新")
+            self.update_btn.setStyleSheet(
+                "QPushButton{background:#e67e22;border:none;"
+                "border-radius:11px;color:#fff;font-size:11px;"
+                "font-weight:600;padding:0 12px;}"
+                "QPushButton:hover{background:#d35400;}"
+                "QPushButton:pressed{background:#b94600;}")
+            self.update_btn.setToolTip(f"新版本 {latest} 可用，点击下载")
+            # 手动点击才弹窗
+            if not silent:
+                self._show_update_dialog(latest, url)
+        else:
+            # 已是最新 → 绿色文字
+            self.update_btn.setText("当前最新版 ✓")
+            self.update_btn.setStyleSheet(
+                "QPushButton{background:transparent;border:1px solid #27ae60;"
+                "border-radius:11px;color:#27ae60;font-size:11px;padding:0 10px;}"
+                "QPushButton:hover{background:rgba(39,174,96,0.1);}")
+            self.update_btn.setToolTip("")
+            if not silent:
+                QMessageBox.information(
+                    self, "检测更新", f"当前已是最新版本  {APP_VERSION} 🎉")
+
+    def _on_update_error(self, msg):
+        self.update_btn.setEnabled(True)
+        silent = self._checking_silent
+        # 无论静默还是手动，网络失败都不弹窗，仅恢复按钮
+        self.update_btn.setText("检测更新")
+        self.update_btn.setStyleSheet(self._btn_style_default())
+        self.update_btn.setToolTip("")
+        # 手动点击时才提示网络错误
+        if not silent:
+            QMessageBox.warning(
+                self, "检测失败", "无法连接更新服务器，请检查网络连接。")
+
+    def _show_update_dialog(self, latest, url):
+        ret = QMessageBox.information(
+            self, "发现新版本",
+            f"当前版本：{APP_VERSION}\n最新版本：{latest}\n\n前往下载页面？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if ret == QMessageBox.StandardButton.Yes:
+            import webbrowser
+            webbrowser.open(url)
 
     def closeEvent(self, e):
         if self.worker and self.worker.isRunning(): self.worker.stop(); self.worker.wait(3000)
