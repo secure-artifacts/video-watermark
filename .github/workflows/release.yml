@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
     permissions:
       id-token: write
@@ -23,10 +23,9 @@ jobs:
           python-version: '3.11'
 
       - name: Install Dependencies
-        run: |
-          pip install PyQt6 pyinstaller
+        run: pip install PyQt6 pyinstaller
 
-      - name: Download FFmpeg
+      - name: Download FFmpeg (Windows)
         run: |
           curl -L "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -o ffmpeg.zip
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
@@ -34,7 +33,7 @@ jobs:
           Copy-Item ffmpeg_tmp\ffmpeg-master-latest-win64-gpl\bin\ffprobe.exe .
           Remove-Item -Recurse -Force ffmpeg_tmp, ffmpeg.zip
 
-      - name: Build with PyInstaller
+      - name: Build with PyInstaller (Windows)
         run: |
           pyinstaller --noconsole --onefile --name 视频加水印 `
             --icon watermark_tool.ico `
@@ -43,13 +42,106 @@ jobs:
             --add-binary "ffprobe.exe;." `
             video_watermark.py
 
-      - name: Attest Build Provenance
+      - name: Attest (Windows)
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: 'dist/视频加水印.exe'
 
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/视频加水印.exe
+
+
+  build-macos:
+    runs-on: macos-latest
+    permissions:
+      id-token: write
+      contents: write
+      attestations: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install PyQt6 pyinstaller
+
+      - name: Download FFmpeg (macOS)
+        run: |
+          curl -L "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip" -o ffmpeg.zip
+          unzip ffmpeg.zip
+          curl -L "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip" -o ffprobe.zip
+          unzip ffprobe.zip
+          chmod +x ffmpeg ffprobe
+
+      - name: Build with PyInstaller (macOS)
+        run: |
+          pyinstaller --noconsole --onefile --name 视频加水印 \
+            --collect-all PyQt6 \
+            --add-binary "ffmpeg:." \
+            --add-binary "ffprobe:." \
+            video_watermark.py
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Create DMG
+        run: |
+          mkdir -p dist/dmg
+          cp -r "dist/视频加水印" dist/dmg/
+          create-dmg \
+            --volname "视频加水印" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "视频加水印" 175 190 \
+            --hide-extension "视频加水印" \
+            --app-drop-link 425 190 \
+            "dist/视频加水印-mac.dmg" \
+            "dist/dmg/"
+
+      - name: Attest (macOS)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/视频加水印-mac.dmg'
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: dist/视频加水印-mac.dmg
+
+
+  release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-dmg
+          path: dist/
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/视频加水印.exe
+          files: |
+            dist/视频加水印.exe
+            dist/视频加水印-mac.dmg
           generate_release_notes: true
